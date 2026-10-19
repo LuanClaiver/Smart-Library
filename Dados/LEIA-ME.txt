@@ -1,0 +1,3 @@
+Os dados persistentes da biblioteca ficam aqui (biblioteca.db, privacidade.json, Miniaturas, servico.log).
+Ao atualizar, copie o CONTEUDO completo desta pasta da versao anterior. Nao compartilhe este diretorio.
+Filtro visual Steam: arquivo `filtros.json` (ajuste preferencialmente pela tela Locais com Admin).

@@ -1,0 +1,38 @@
+# Configuracoes e dados privados (NUNCA enviar ao GitHub)
+Dados/*
+!Dados/LEIA-ME.txt
+!Dados/area_privada.exemplo.json
+
+# Runtime Windows / Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.exe
+*.pdb
+*.dll
+*.log
+*.tmp
+Servidor/python-servico.txt
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+.env
+.env.*
+Ferramentas/ffmpeg.exe
+
+# Ambiente local
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Segredos e pacotes locais
+*.key
+*.pem
+*.pfx
+*.p12
+*.bak
+*.zip
+*.7z

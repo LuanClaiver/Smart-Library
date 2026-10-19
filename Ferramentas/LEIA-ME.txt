@@ -1,0 +1,2 @@
+Esta pasta contem os scripts administrativos e pode receber ffmpeg.exe (opcional).
+Use Gerenciar Smart Library.bat na raiz para acessar os scripts sem entrar nesta pasta.
