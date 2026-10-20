@@ -1,5 +1,5 @@
-#requires -Version 5.1
-# Instalador Smart Library v1.0.15 - Windows PowerShell 5.1
+﻿#requires -Version 5.1
+# Instalador Smart Library v1.0.17 - Windows PowerShell 5.1
 $ErrorActionPreference = 'Stop'
 $base = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location -LiteralPath $base
@@ -95,7 +95,7 @@ try {
   if (-not (Test-Path -LiteralPath (Join-Path $base 'Dados\privacidade.json'))) {
     throw 'Senha Admin nao configurada. Abra Gerenciar Smart Library.bat e escolha 7 primeiro.'
   }
-  Log-Instalacao '=== Instalacao/atualizacao Smart Library v1.0.15 ==='
+  Log-Instalacao '=== Instalacao/atualizacao Smart Library v1.0.17 ==='
   $python=Obter-Python
   Log-Instalacao ('Python validado: '+$python)
   if ($python -match '\\Users\\[^\\]+\\AppData\\') {

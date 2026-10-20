@@ -7,7 +7,8 @@ const categories = [
  ['Imagens','image'],['Documentos','file'],['Instaladores','package'],['Outros','folder'],['Transferências','drive'],['Duplicados','copy'],['Quarentena','trash'],['Locais','drive'],['Protegidos','lock']
 ];
 let currentCategory='Todos', page=1, editId=null, searchTimeout=null, lastStatus=null, wasScanning=false, itemsMap={},viewMode='grid';
-let isAdmin=false,serviceMode=false,canLocate=false,mediaView='folders',mediaSource='',mediaFolder='',folderQuerySequence=0;
+let isAdmin=false,serviceMode=false,canLocate=false,mediaView='folders',mediaSource='',mediaFolder='',mediaCollection='',folderQuerySequence=0;
+let metadataTaskActive=false,metadataResults=[],metadataSearchBusy=false;
 let gameFilter='', privateReady=false,privateIsOpen=false,subcategoryFilter='',extensionFilter='',filtersRequest=0;
 let browseData=null,browseMode='folder',browseTarget='addPath',selectedExecutable=null,browseRequest=0;
 let currentTrack=null,musicQueue=[],musicQueueIndex=-1,musicQueuePrivate=false,viewerItemId=null,musicMinimized=false,queueReady=Promise.resolve();
@@ -136,6 +137,7 @@ function renderNav(){
  $('nav').querySelectorAll('[data-category]').forEach(button=>button.addEventListener('click',()=>changeCategory(button.dataset.category)));
 }
 async function changeCategory(category,verifiedProtected=false){
+ if(category!==currentCategory){mediaCollection='';mediaFolder='';}
  if(!isAdmin&&['Protegidos','Duplicados','Locais','Quarentena','Transferências'].includes(category)){openPrivateDialog(true);return;}
  if(category==='Protegidos'&&!verifiedProtected){
   if(!isAdmin){openPrivateDialog(true);return;}
@@ -188,6 +190,7 @@ async function refresh(){
   $('ignoreSteamMedia').checked=Boolean(filterSettings.ocultar_midias_steam);
   $('ignoreSteamMedia').disabled=!isAdmin;
   $('ignoredSteamCount').textContent=Number(response.ignored_media_count||0).toLocaleString('pt-BR')+' arquivo(s) interno(s) de jogos ocultado(s) do catálogo';
+  if($('backupSummary'))$('backupSummary').textContent=response.backup?.last?'Último backup: '+response.backup.last.replace('T',' ')+' · '+response.backup.count+' cópia(s)':'Backup automático ainda não criado';
   const f=$('sourceFilter'),old=f.value;
   f.innerHTML='<option value="">Todos os locais</option>'+response.sources.map(s=>`<option value="${escapeHTML(s.id)}">${escapeHTML(s.path)}</option>`).join('');
   f.value=response.sources.some(s=>s.id===old)?old:'';
@@ -220,7 +223,11 @@ function renderMediaFolderNav(data){
  }
  $('mediaFolderPath').innerHTML=crumbs.join('');
 }
-async function openMediaDirectory(source,folder){mediaSource=source;mediaFolder=folder;page=1;resetMulti();await loadItems();}
+async function openMediaDirectory(source,folder){mediaSource=source;mediaFolder=folder;mediaCollection='';page=1;resetMulti();await loadItems();}
+async function openMediaCollection(name){mediaCollection=name;page=1;resetMulti();await loadItems();}
+function mediaCollectionCard(f){
+ return `<button type="button" class="media-directory" data-media-collection="${escapeHTML(f.name)}"><div class="media-directory-cover">${ico('folder')}${f.cover_id?`<img loading="lazy" alt="" src="/api/thumb/${encodeURIComponent(f.cover_id)}" onerror="this.hidden=true">`:''}</div><div class="media-directory-name" title="${escapeHTML(f.name)}">${escapeHTML(f.name)}</div><div class="media-directory-sub">${f.count} ${f.count===1?'item':'itens'}</div></button>`;
+}
 async function refreshQuarantine(){
  if(!isAdmin)return;
  const node=$('quarantineList');node.innerHTML='<p class="modal-desc">Consultando a Quarentena…</p>';
@@ -251,8 +258,22 @@ async function loadItems(){
  if(['Locais','Duplicados','Quarentena','Transferências'].includes(currentCategory))return;
  const requestedCat=currentCategory,requestedPage=page,requestedQuery=$('query').value,requestedSub=subcategoryFilter,requestedExt=extensionFilter;
  let folderPrefix='',inFolders=isMediaCategory()&&mediaView==='folders'&&!requestedQuery&&!requestedExt;
+ const inCollections=isMediaCategory()&&mediaView==='collections'&&!requestedQuery&&!requestedExt;
  $('mediaFolderBar').classList.toggle('hidden',!isMediaCategory());
  try{
+  if(inCollections){
+   $('mediaFolderBar').classList.remove('hidden');
+   const bar=$('mediaFolderBar');bar.querySelectorAll('[data-media-view]').forEach(b=>b.classList.toggle('active',b.dataset.mediaView===mediaView));
+   $('mediaFolderPath').innerHTML=`<button type="button" data-media-reset>${escapeHTML(currentCategory)}</button>${mediaCollection?`<span>›</span><strong>${escapeHTML(mediaCollection)}</strong>`:''}`;
+   if(!mediaCollection){
+    const nav=await api('/api/media/collections?'+new URLSearchParams({category:requestedCat}));
+    if(requestedCat!==currentCategory)return;
+    const dirs=nav.collections||[];
+    $('items').innerHTML=dirs.length?dirs.map(mediaCollectionCard).join(''):'<div class="empty-state">Nenhuma série ou coleção identificada. Experimente visualizar por pastas ou todos os arquivos.</div>';
+    $('pages').innerHTML='';$('resultCount').textContent=dirs.reduce((n,f)=>n+f.count,0).toLocaleString('pt-BR');
+    syncMulti();return;
+   }
+  }
   if(inFolders){
    if(!mediaSource && $('sourceFilter').value){mediaSource=$('sourceFilter').value;mediaFolder='';}
    const nav=await api('/api/media/folders?'+new URLSearchParams({category:requestedCat,source:mediaSource,folder:mediaFolder}));
@@ -268,6 +289,7 @@ async function loadItems(){
   }else if(isMediaCategory())renderMediaFolderNav({});
   const params=new URLSearchParams({category:requestedCat,page:String(requestedPage),q:requestedQuery,source:inFolders?mediaSource:$('sourceFilter').value,game_status:gameFilter,subcategory:requestedSub,extension:requestedExt});
   if(inFolders)params.set('folder',mediaFolder);
+  if(inCollections&&mediaCollection)params.set('collection',mediaCollection);
 
   const res=await api('/api/items?'+params);
   if(currentCategory!==requestedCat||page!==requestedPage||$('query').value!==requestedQuery||subcategoryFilter!==requestedSub||extensionFilter!==requestedExt)return;
@@ -301,8 +323,15 @@ function renderCard(item){
  const localArt=!item.cover?`<img class="local-poster" loading="lazy" alt="" src="/api/art/${encodeURIComponent(item.id)}" onerror="this.hidden=true">`:'';
  const thumb=isVideo&&!item.cover?`<img class="video-thumb" loading="lazy" alt="Miniatura do vídeo" src="/api/thumb/${encodeURIComponent(item.id)}" onerror="this.hidden=true">`:'';
  const preview=isVideo&&/\.(mp4|webm|m4v)$/i.test(item.path)?`<video class="hover-preview" aria-hidden="true" muted playsinline loop preload="none" data-preview="/api/stream/${encodeURIComponent(item.id)}"></video>`:'';
+ const mediaMeta=item.metadata||{};
+ const metaParts=[];
+ if(item.category==='Séries'&&item.season!==null&&item.season!==undefined&&item.episode!==null&&item.episode!==undefined)metaParts.push(`T${String(item.season).padStart(2,'0')} · E${String(item.episode).padStart(2,'0')}`);
+ if(mediaMeta.artist)metaParts.push(mediaMeta.artist);
+ if(mediaMeta.genre)metaParts.push(mediaMeta.genre);
+ if(item.media_year||mediaMeta.year)metaParts.push(String(item.media_year||mediaMeta.year));
+ const extraMeta=metaParts.length?`<div class="media-metadata" title="${escapeHTML(metaParts.join(' · '))}">${escapeHTML(metaParts.join(' · '))}</div>`:'';
  const status=isGame&&item.game_status?`<span class="item-status ${needsInstall?'install':item.game_status==='Instalados'?'installed':'review'}">${escapeHTML(item.game_status)}</span>`:'';
- return `<article class="media-card ${multiSelected.has(item.id)?'selected':''}"><div class="poster"><label class="selection-box" title="Selecionar item"><input type="checkbox" data-select="${escapeHTML(item.id)}" aria-label="Selecionar ${escapeHTML(item.name)}" ${multiSelected.has(item.id)?'checked':''}></label>${ico(glyph)}${localArt}${thumb}${item.cover?`<img loading="lazy" alt="" src="${escapeHTML(item.cover)}" onerror="this.hidden=true">`:''}${preview}<span class="category-sticker">${escapeHTML(item.category)}</span>${item.available?'':'<span class="unavailable">Desconectado</span>'}</div><div class="media-details"><div>${status}<div class="media-title" title="${escapeHTML(item.name)}">${escapeHTML(item.name)}</div>${item.kind==='file'?`<div class="file-format-label">${escapeHTML(formatLabel(item.extension||'[sem extensão]'))}</div>`:''}<div class="media-path" title="${escapeHTML(item.path)}">${escapeHTML(item.path)}</div></div><div class="media-actions">${(canLocate||playable)?`<button class="mini-action" type="button" data-open="${escapeHTML(item.id)}">${primary}</button>`:''}${canLocate?`<button class="mini-action mini-locate" type="button" data-locate="${escapeHTML(item.id)}" title="Abrir local do arquivo no Explorador" aria-label="Abrir local do arquivo ${escapeHTML(item.name)}">${ico('folder')}<span>Local</span></button>`:''}${item.kind==='file'?`<a class="mini-action mini-download" href="/api/download/${encodeURIComponent(item.id)}" download title="Baixar arquivo">${ico('drive')}<span>Baixar</span></a>`:''}${isAdmin?`<button class="mini-action" type="button" data-edit="${escapeHTML(item.id)}">Editar</button>`:''}</div></div></article>`;
+ return `<article class="media-card ${multiSelected.has(item.id)?'selected':''}"><div class="poster"><label class="selection-box" title="Selecionar item"><input type="checkbox" data-select="${escapeHTML(item.id)}" aria-label="Selecionar ${escapeHTML(item.name)}" ${multiSelected.has(item.id)?'checked':''}></label>${ico(glyph)}${localArt}${thumb}${item.cover?`<img loading="lazy" alt="" src="${escapeHTML(item.cover)}" onerror="this.hidden=true">`:''}${preview}<span class="category-sticker">${escapeHTML(item.category)}</span>${item.available?'':'<span class="unavailable">Desconectado</span>'}</div><div class="media-details"><div>${status}<div class="media-title" title="${escapeHTML(item.name)}">${escapeHTML(item.name)}</div>${extraMeta}${item.kind==='file'?`<div class="file-format-label">${escapeHTML(formatLabel(item.extension||'[sem extensão]'))}</div>`:''}<div class="media-path" title="${escapeHTML(item.path)}">${escapeHTML(item.path)}</div></div><div class="media-actions">${(canLocate||playable)?`<button class="mini-action" type="button" data-open="${escapeHTML(item.id)}">${primary}</button>`:''}${canLocate?`<button class="mini-action mini-locate" type="button" data-locate="${escapeHTML(item.id)}" title="Abrir local do arquivo no Explorador" aria-label="Abrir local do arquivo ${escapeHTML(item.name)}">${ico('folder')}<span>Local</span></button>`:''}${item.kind==='file'?`<a class="mini-action mini-download" href="/api/download/${encodeURIComponent(item.id)}" download title="Baixar arquivo">${ico('drive')}<span>Baixar</span></a>`:''}${isAdmin?`<button class="mini-action" type="button" data-edit="${escapeHTML(item.id)}">Editar</button>`:''}</div></div></article>`;
 }
 function renderGameFilters(){
  $('gameFilters').querySelectorAll('[data-game-filter]').forEach(el=>el.classList.toggle('active',el.dataset.gameFilter===gameFilter));
@@ -408,7 +437,53 @@ function editItem(id){
  $('editCategory').value=item.category_override||'';$('editTypeHint').textContent='Formato real: '+(item.kind==='folder'?'Pasta':formatLabel(item.extension||'[sem extensão]'))+'. Alterar a categoria não modifica o arquivo no Windows.';
  $('coverSearchOpen').classList.toggle('hidden',Boolean(item.hidden));
  $('editLaunch').value=item.launch_path||'';$('editGameStatus').value=item.game_status_override||'';updateEditGameFields();
+ const meta=item.metadata||{};
+ $('metadataSummary').textContent=meta.title?`Identificado: ${meta.title}${meta.year?' ('+meta.year+')':''}${meta.genre?' · '+meta.genre:''}${meta.artist?' · '+meta.artist:''}${meta.provider?' · '+meta.provider:''}`:'Sem informações externas. Você pode buscar e confirmar a identificação.';
+ $('metadataEditor').classList.toggle('hidden',!['Jogos','Filmes','Séries','Músicas'].includes(item.category)||Boolean(item.hidden));
  $('editPath').textContent='Local original: '+item.path;showDialog('editDialog');
+}
+function openMetadataSearch(){
+ const item=itemsMap[editId];if(!item||item.hidden)return;
+ $('metadataQuery').value=item.series_title||item.name;
+ $('metadataProvider').value='auto';$('metadataResults').innerHTML='<p class="modal-desc">Escolha uma fonte e clique em Pesquisar.</p>';
+ showDialog('metadataDialog');
+}
+async function searchMetadata(){
+ if(metadataSearchBusy)return;
+ const item=itemsMap[editId];if(!item)return;
+ metadataSearchBusy=true;$('metadataSearch').disabled=true;
+ $('metadataResults').innerHTML='<p class="modal-desc">Consultando a base de dados…</p>';
+ try{
+  const res=await api('/api/metadata/search','POST',{id:item.id,provider:$('metadataProvider').value,query:$('metadataQuery').value.trim()});
+  metadataResults=res.results||[];
+  $('metadataResults').innerHTML=metadataResults.length?metadataResults.map((r,i)=>`<article class="metadata-result"><div class="metadata-result-cover">${r.cover?`<img loading="lazy" src="${escapeHTML(r.cover)}" alt="" onerror="this.hidden=true">`:ico('image')}</div><div class="metadata-result-body"><strong>${escapeHTML(r.title)}</strong><small>${escapeHTML([r.year,r.artist,r.genre,r.provider].filter(Boolean).join(' · '))}</small><p>${escapeHTML((r.overview||'').slice(0,230))}</p><small>Correspondência: ${Math.round((r.confidence||0)*100)}%</small></div><button type="button" class="btn btn-primary btn-small" data-pick-metadata="${i}">Usar</button></article>`).join(''):'<p class="modal-desc">Nenhum resultado. Confira o título, ou experimente outra fonte. '+escapeHTML((res.errors||[]).join(' · '))+'</p>';
+  $('metadataResults').querySelectorAll('[data-pick-metadata]').forEach(b=>b.addEventListener('click',()=>applyMetadata(Number(b.dataset.pickMetadata))));
+ }catch(e){$('metadataResults').textContent='Falha na pesquisa: '+e.message;}
+ finally{metadataSearchBusy=false;$('metadataSearch').disabled=false;}
+}
+async function applyMetadata(index){
+ const choice=metadataResults[index];const item=itemsMap[editId];if(!choice||!item)return;
+ const replaceCover=Boolean(item.cover)?await message('Substituir capa existente?',`O item já tem capa. Deseja substituir pela capa de ${choice.provider}?`,{confirm:true,confirmLabel:'Substituir capa'}):true;
+ try{
+  await api('/api/metadata/apply','POST',{id:item.id,choice,replace_cover:replaceCover});
+  closeDialog('metadataDialog');closeDialog('editDialog');toast('Informações aplicadas.','success');await loadItems();
+ }catch(e){await message('Erro ao aplicar informações',e.message,{kind:'error'});}
+}
+async function startAutoMetadata(){
+ if(!isAdmin)return;
+ if(!await message('Identificar até 25 itens?', 'O Smart Library enviará os nomes de até 25 arquivos públicos sem capa para serviços externos (iTunes, Steam ou TMDb, se configurado). Arquivos protegidos não serão enviados. Resultados de baixa confiança serão ignorados. As capas já escolhidas serão preservadas.',{confirm:true,confirmLabel:'Iniciar identificação'}))return;
+ try{
+  await api('/api/metadata/auto','POST',{limit:25,category:['Jogos','Filmes','Séries','Músicas'].includes(currentCategory)?currentCategory:''});
+  toast('Identificação iniciada em segundo plano.','success');metadataTaskActive=true;pollMetadata();
+ }catch(e){await message('Identificação indisponível',e.message,{kind:'error'});}
+}
+async function pollMetadata(){
+ if(!isAdmin)return;
+ try{
+  const s=(await api('/api/metadata/status')).task;
+  $('metadataProgress').textContent=s.running?`${s.processed} analisados · ${s.updated} capas · em andamento`:(s.finished_at?`Concluído: ${s.updated} capas · ${s.skipped} revisões pendentes`:'');
+  if(metadataTaskActive&&!s.running){metadataTaskActive=false;loadItems();}
+ }catch(_){}
 }
 function openCoverSearch(){
  const item=selectedDiskItem();if(!item||item.hidden)return;
@@ -809,6 +884,8 @@ Arquivos existentes com o mesmo nome não serão substituídos.`,{confirm:true,c
  finally{uploadAbort=null;$('uploadStart').disabled=false;$('uploadCancel').disabled=true;}
 }
 function refreshAdminUI(){
+ $('intelligenceTools').classList.toggle('hidden',!isAdmin);
+ $('backupNow')?.classList.toggle('hidden',!isAdmin);
  $('adminAccess').textContent=isAdmin?'Sair do Admin':'Entrar como Admin';
  ['addButton','scanButton','addSourceSecondary','duplicatesStart'].forEach(id=>{const x=$(id);if(x)x.classList.toggle('hidden',!isAdmin);});
  $('toggleMulti').classList.toggle('hidden',!isAdmin);
@@ -832,6 +909,13 @@ function setup(){
  $('duplicatesStart').addEventListener('click',startDuplicates);
  $('duplicatesStop').addEventListener('click',stopDuplicates);
  $('scanButton').addEventListener('click',scan);$('sourceForm').addEventListener('submit',saveSource);$('editForm').addEventListener('submit',saveEdit);
+ $('backupNow')?.addEventListener('click',async()=>{
+  if(!isAdmin){toast('Somente o administrador pode criar backups.','error');return;}
+  const button=$('backupNow');button.disabled=true;
+  try{const result=await api('/api/backup','POST');toast('Backup criado: '+result.created,'success');await refresh();}
+  catch(error){await message('Falha no backup',error.message,{kind:'error'});}
+  finally{button.disabled=false;}
+ });
  $('ignoreSteamMedia').addEventListener('change',async event=>{
   const checkbox=event.currentTarget;
   if(!isAdmin){checkbox.checked=!checkbox.checked;return;}
@@ -867,14 +951,23 @@ function setup(){
  });
  $('gridView').addEventListener('click',()=>{viewMode='grid';$('items').classList.remove('list-mode');$('gridView').classList.add('active');$('listView').classList.remove('active');});
  $('listView').addEventListener('click',()=>{viewMode='list';$('items').classList.add('list-mode');$('listView').classList.add('active');$('gridView').classList.remove('active');});
+ $('metadataOpen').addEventListener('click',openMetadataSearch);
+ $('metadataSearch').addEventListener('click',searchMetadata);
+ $('metadataQuery').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();searchMetadata();}});
+ $('autoMetadataButton').addEventListener('click',startAutoMetadata);
  $('coverSearchOpen').addEventListener('click',openCoverSearch);
  $('coverSearchRun').addEventListener('click',runCoverSearch);$('coverExternalSearch').addEventListener('click',()=>{const q=$('coverQuery').value.trim();if(q)window.open('https://www.google.com/search?tbm=isch&q='+encodeURIComponent(q),'_blank','noopener,noreferrer');});
  $('coverQuery').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();runCoverSearch();}});
  $('renameDisk').addEventListener('click',openRename);
  $('moveDisk').addEventListener('click',openMove);
  $('trashDisk').addEventListener('click',openTrash);
- $('mediaFolderBar').addEventListener('click',e=>{const b=e.target.closest('[data-media-view],[data-media-reset],[data-media-go]');if(!b)return;if(b.dataset.mediaView){mediaView=b.dataset.mediaView;page=1;loadItems();return;}if(b.hasAttribute('data-media-reset'))openMediaDirectory('','');else if(b.hasAttribute('data-media-go'))openMediaDirectory(mediaSource,b.dataset.mediaGo);});
- $('items').addEventListener('click',e=>{const b=e.target.closest('[data-media-folder]');if(b){openMediaDirectory(b.dataset.mediaSource,b.dataset.mediaFolder);}});
+ $('mediaFolderBar').addEventListener('click',e=>{const b=e.target.closest('[data-media-view],[data-media-reset],[data-media-go]');if(!b)return;
+ if(b.dataset.mediaView){mediaView=b.dataset.mediaView;mediaCollection='';mediaFolder='';page=1;loadItems();return;}
+ if(b.hasAttribute('data-media-reset')){if(mediaView==='collections')openMediaCollection('');else openMediaDirectory('','');}
+ else if(b.hasAttribute('data-media-go'))openMediaDirectory(mediaSource,b.dataset.mediaGo);
+ });
+ $('items').addEventListener('click',e=>{const c=e.target.closest('[data-media-collection]');if(c){openMediaCollection(c.dataset.mediaCollection);return;}
+ const b=e.target.closest('[data-media-folder]');if(b){openMediaDirectory(b.dataset.mediaSource,b.dataset.mediaFolder);}});
  $('renameForm').addEventListener('submit',handleRename);
  $('moveForm').addEventListener('submit',handleMove);
  $('trashForm').addEventListener('submit',handleTrash);
@@ -885,6 +978,6 @@ function setup(){
  $('browseHome').addEventListener('click',()=>browseNavigate('').catch(()=>{}));
  $('browseSearch').addEventListener('input',renderBrowser);
  $('browseChoose').addEventListener('click',chooseBrowse);
- refreshTypeFilters();refresh();loadItems();setInterval(refresh,3000);
+ refreshTypeFilters();refresh();loadItems();setInterval(refresh,3000);setInterval(()=>{if(isAdmin)pollMetadata();},5000);
 }
 setup();

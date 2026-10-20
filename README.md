@@ -40,7 +40,7 @@ python -m compileall -q Servidor
 node --check Interface/app.js
 ```
 
-Sem dependências Python externas para o servidor HTTP básico. A busca de capas utiliza consultas externas opcionais (Wikimedia Commons/Steam). O uso de FFmpeg é opcional para miniaturas.
+Sem dependências Python externas para o servidor HTTP básico. A busca de capas e metadados utiliza consultas externas opcionais (Wikimedia Commons, Steam, iTunes, MusicBrainz e TMDb com chave própria). O uso de FFmpeg é opcional para miniaturas.
 
 ## Segurança e publicação
 
@@ -49,3 +49,10 @@ Sem dependências Python externas para o servidor HTTP básico. A busca de capas
 Leia [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md) e [PUBLICAR-NO-GITHUB.md](PUBLICAR-NO-GITHUB.md).
 
 Este repositório não inclui licença de distribuição explícita. Escolha e adicione uma licença antes de convidar terceiros a redistribuir/modificar o código.
+
+
+## Atualização v1.0.17
+
+Esta versão acrescenta reconhecimento local de temporadas e episódios, coleções de filmes e séries, pesquisa opt-in de capas/metadados por Steam/iTunes/MusicBrainz e TMDb opcional. Consulte `Documentacao/ALTERACOES-v1.0.17.md` e `Documentacao/ROADMAP.md`. Recursos da versão v1.0.16, como backups automáticos, continuam disponíveis.
+
+Para publicar futuras versões, execute `Enviar para GitHub.bat` na pasta preparada. O envio requer Git for Windows.

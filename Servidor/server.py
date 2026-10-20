@@ -1,4 +1,4 @@
-"""Smart Library v1.0.15 — biblioteca local do Windows, sem dependências externas."""
+"""Smart Library v1.0.17 — biblioteca local do Windows, sem dependências externas."""
 from __future__ import annotations
 import os, sys, json, sqlite3, threading, mimetypes, subprocess, re, shutil, time, uuid, webbrowser, secrets, hashlib, hmac, http.cookies, functools, ntpath, socket
 from pathlib import Path
@@ -6,10 +6,13 @@ from urllib.parse import urlparse, parse_qs, unquote, quote, urlencode
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 from duplicate_finder import DuplicateFinder
+from backup_manager import BackupManager
+from metadata_catalog import parse_local, lookup as lookup_metadata
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / 'Dados'
 DB = DATA / 'biblioteca.db'
+BACKUPS = BackupManager(DATA, DB)
 PRIVATE_SETTINGS=DATA / 'privacidade.json'
 THUMBS=DATA / 'Miniaturas'
 THUMBS.mkdir(exist_ok=True)
@@ -63,6 +66,93 @@ EXT = {
 # Arquivos de suporte de jogos devem existir no disco mas nao poluir a biblioteca.
 # A regra preserva pastas de jogos, ISOs de instalacao e fontes de midia pessoais.
 MEDIA_FILTERS_FILE = DATA / 'filtros.json'
+METADATA_SETTINGS=DATA/'metadados.json'
+METADATA_TASK={'running':False,'processed':0,'updated':0,'skipped':0,'error':'','current':'','finished_at':None}
+METADATA_TASK_LOCK=threading.Lock()
+
+def tmdb_key():
+ try:
+  cfg=json.loads(METADATA_SETTINGS.read_text(encoding='utf-8'))
+  token=str(cfg.get('tmdb_api_key','')).strip()
+  return token[:160] if re.fullmatch(r'[a-zA-Z0-9]{20,160}',token) else ''
+ except (ValueError,OSError,TypeError):return ''
+
+def decorate_item(row):
+ item=dict(row)
+ raw=item.pop('metadata_json','') or ''
+ try:item['metadata']=json.loads(raw) if raw else {}
+ except (ValueError,TypeError):item['metadata']={}
+ return item
+
+def collection_name(item):
+ if item['category']=='Séries':return (item['series_title'] or '').strip()
+ if item['category']=='Filmes':return (item['collection_name'] or '').strip()
+ return ''
+
+def _safe_metadata_choice(data):
+ if not isinstance(data,dict):raise ValueError('Escolha inválida.')
+ fields=('title','cover','overview','year','genre','artist','collection','provider','record_id','url')
+ choice={k:data.get(k,'') for k in fields}
+ for name in fields:
+  if name!='year':choice[name]=str(choice[name] or '')[:1800 if name=='overview' else 700 if name in ('cover','url') else 180]
+ try:choice['year']=int(choice['year']) if choice['year'] else None
+ except (TypeError,ValueError):choice['year']=None
+ if choice['year'] and not 1800<=choice['year']<=2100:choice['year']=None
+ if choice['provider'] not in ('Steam','iTunes','MusicBrainz','TMDB'):raise ValueError('Fonte inválida.')
+ if not choice['title'].strip():raise ValueError('Título inválido.')
+ for url_field in ('cover','url'):
+  if choice[url_field] and not choice[url_field].startswith('https://'):
+   choice[url_field]=''
+ return choice
+
+def apply_metadata(db,item,choice,force_cover=False):
+ choice=_safe_metadata_choice(choice)
+ # Não muda arquivos físicos nem a categoria definida manualmente.
+ local=parse_local(item['path'],item['category'])
+ collection=choice['collection'] or item['collection_name'] or local['collection']
+ year=choice['year'] or item['media_year'] or local['year']
+ db.execute('''UPDATE items SET metadata_json=?,cover=?,collection_name=?,media_year=? WHERE id=?''',
+    (json.dumps(choice,ensure_ascii=False),choice['cover'] if (force_cover or not item['cover']) and choice['cover'] else item['cover'],
+     collection if item['category']=='Filmes' else item['collection_name'],year,item['id']))
+
+def metadata_batch_worker(limit=25,cat='',remote=False):
+ try:
+  with conn() as db:
+   where="kind='file' AND hidden=0 AND ignored=0 AND available=1 AND (metadata_json='' OR metadata_json IS NULL) AND (cover='' OR cover IS NULL)"
+   args=[]
+   if cat:where+=' AND category=?';args.append(cat)
+   else:where+=" AND category IN ('Jogos','Filmes','Séries','Músicas')"
+   if remote:where+=" AND UPPER(SUBSTR(path,1,2))!='C:'"
+   rows=[dict(r) for r in db.execute('SELECT * FROM items WHERE '+where+' ORDER BY category,name LIMIT ?',args+[limit])]
+  for item in rows:
+   with METADATA_TASK_LOCK:METADATA_TASK['current']=item['category']+' · '+item['name'][:80]
+   if item['hidden'] or in_private_folder(item['path']):continue
+   local=parse_local(item['path'],item['category']);query=local['title']
+   if item['category']=='Séries':query=local['series_title'] or query
+   try:
+    found=lookup_metadata(query,item['category'],tmdb_key=tmdb_key())['results']
+    # Não associar capas a resultados duvidosos (ex.: músicas homônimas).
+    winner=next((r for r in found if r['confidence']>=0.94 and r.get('cover')),None)
+    if winner:
+     with conn() as db:
+      current=db.execute('SELECT * FROM items WHERE id=?',(item['id'],)).fetchone()
+      if current and not current['hidden'] and not current['metadata_json'] and not current['cover']:
+       apply_metadata(db,current,winner)
+       with METADATA_TASK_LOCK:METADATA_TASK['updated']+=1
+      else:
+       with METADATA_TASK_LOCK:METADATA_TASK['skipped']+=1
+    else:
+     with METADATA_TASK_LOCK:METADATA_TASK['skipped']+=1
+   except Exception:
+    with METADATA_TASK_LOCK:METADATA_TASK['skipped']+=1
+   with METADATA_TASK_LOCK:METADATA_TASK['processed']+=1
+   time.sleep(0.6) # respeita limitações das bases de dados externas
+ except Exception as exc:
+  with METADATA_TASK_LOCK:METADATA_TASK['error']=type(exc).__name__
+ finally:
+  with METADATA_TASK_LOCK:
+   METADATA_TASK['running']=False;METADATA_TASK['current']='';METADATA_TASK['finished_at']=datetime.now().isoformat(timespec='seconds')
+
 # Nomes de bibliotecas e diretórios técnicos conhecidos. Não confundir uma pasta
 # pessoal com bibliotecas de programas somente por conter a palavra "games".
 STEAM_PATH_NAMES = {
@@ -166,7 +256,8 @@ EXCLUDE_DIRS = {'.smartlibrary-quarentena','$recycle.bin','system volume informa
 CAT = {'Jogos','Filmes','Séries','Músicas','Vídeos','Imagens','Documentos','Instaladores','Outros','Automático'}
 LOCK = threading.Lock()
 FS_LOCK = threading.RLock()
-STATE = {'running':False,'processed':0,'found':0,'current':'','error':'','finished_at':None}
+STATE = {'running':False,'processed':0,'found':0,'current':'','error':'','finished_at':None,
+         'sources_ok':0,'sources_failed':0,'sources_offline':0,'entries_removed':0}
 SERVICE_MODE=os.environ.get('SMART_LIBRARY_SERVICE')=='1'
 HOST=os.environ.get('SMART_LIBRARY_HOST', '0.0.0.0' if SERVICE_MODE else '127.0.0.1')
 
@@ -483,6 +574,24 @@ def init():
   if 'extension' not in cols:c.execute("ALTER TABLE items ADD COLUMN extension TEXT NOT NULL DEFAULT ''")
   if 'category_override' not in cols:c.execute("ALTER TABLE items ADD COLUMN category_override TEXT NOT NULL DEFAULT ''")
   if 'ignored' not in cols:c.execute('ALTER TABLE items ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0')
+  # v1.0.17: metadados locais independentes de consultas externas.
+  if 'metadata_json' not in cols:c.execute("ALTER TABLE items ADD COLUMN metadata_json TEXT NOT NULL DEFAULT ''")
+  if 'series_title' not in cols:c.execute("ALTER TABLE items ADD COLUMN series_title TEXT NOT NULL DEFAULT ''")
+  if 'season' not in cols:c.execute('ALTER TABLE items ADD COLUMN season INTEGER')
+  if 'episode' not in cols:c.execute('ALTER TABLE items ADD COLUMN episode INTEGER')
+  if 'collection_name' not in cols:c.execute("ALTER TABLE items ADD COLUMN collection_name TEXT NOT NULL DEFAULT ''")
+  if 'media_year' not in cols:c.execute('ALTER TABLE items ADD COLUMN media_year INTEGER')
+  c.execute('CREATE INDEX IF NOT EXISTS ix_items_series ON items(category,series_title,season,episode)')
+  c.execute('CREATE INDEX IF NOT EXISTS ix_items_collections ON items(category,collection_name)')
+  # Migração idempotente: preserva capas, nomes personalizados e estado de privacidade.
+  migration_117=DATA/'.metadados_locais_v117'
+  if not migration_117.exists():
+   for r in c.execute("SELECT id,path,category,kind FROM items WHERE kind='file' AND category IN ('Filmes','Séries')").fetchall():
+    meta=parse_local(r['path'],r['category'])
+    c.execute('UPDATE items SET series_title=?,season=?,episode=?,collection_name=?,media_year=? WHERE id=?',
+         (meta['series_title'],meta['season'],meta['episode'],meta['collection'],meta['year'],r['id']))
+   c.commit()
+   migration_117.write_text('1',encoding='utf-8')
   c.execute('CREATE INDEX IF NOT EXISTS ix_items_extension ON items(extension)')
   # Migra itens legados sem alterar nomes, capas, senhas e caminhos.
   # Apenas a categoria automatica é recalculada; alterações manuais posteriores prevalecem.
@@ -545,7 +654,7 @@ def category(path, chosen):
  if suffix in EXT['Imagens']:return 'Imagens'
  if suffix in EXT['Músicas']:return 'Músicas'
  if suffix in EXT['Filmes']:
-  return 'Vídeos' if chosen=='Vídeos' else 'Séries' if chosen=='Séries' or (chosen=='Automático' and any('serie' in x.lower() or 'série' in x.lower() or 'season' in x.lower() for x in Path(path).parts)) else 'Filmes'
+  return 'Vídeos' if chosen=='Vídeos' else 'Séries' if chosen=='Séries' or (chosen=='Automático' and (parse_local(path,'Séries')['episode'] is not None or any('serie' in x.lower() or 'série' in x.lower() or 'season' in x.lower() for x in Path(path).parts))) else 'Filmes'
  if suffix in EXT['Documentos']:return 'Documentos'
  if suffix in EXT['Instaladores']:
   return 'Jogos' if chosen=='Jogos' else 'Instaladores'
@@ -571,7 +680,8 @@ def json_reply(h,data,code=200):
 def scan():
  with LOCK:
   if STATE['running']:return False
-  STATE.update(running=True,processed=0,found=0,current='',error='',finished_at=None)
+  STATE.update(running=True,processed=0,found=0,current='',error='',finished_at=None,
+               sources_ok=0,sources_failed=0,sources_offline=0,entries_removed=0)
  threading.Thread(target=scan_worker,daemon=True).start()
  return True
 
@@ -585,23 +695,32 @@ def scan_worker():
    is_game_library=source['category']=='Jogos' or (source['category']=='Automático' and root.name.casefold() in GAME_GROUPS and root.name.casefold() in {'jogos','games'})
    with LOCK:STATE['current']=str(root) if not is_hidden_path(str(root),source['path']) else 'Área protegida'
    if not root.is_dir():
+    # Unidade removível/offline: manter catálogo e marcar disponibilidade,
+    # sem apagar personalizações e sem tratar indisponibilidade como privacidade.
     with conn() as db:db.execute('UPDATE items SET available=0 WHERE source_id=?',(sid,))
+    with LOCK:STATE['sources_offline']+=1
     continue
-   now=datetime.now().isoformat(timespec='seconds')
-   with conn() as db:db.execute('UPDATE items SET available=0 WHERE source_id=?',(sid,))
+   # Token por leitura: uma fonte interrompida nunca pode apagar registros antigos.
+   now=datetime.now().isoformat(timespec='microseconds')+'-'+uuid.uuid4().hex[:8]
+   scan_source_error=False
    pending=[]
    def push():
     if pending:
      with conn() as db:
-      db.executemany('''INSERT INTO items(id,source_id,path,name,category,kind,size,mtime,available,scanned_at,hidden,game_status,extension,ignored)
-       VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET source_id=excluded.source_id,name=excluded.name,category=CASE WHEN items.category_override!='' THEN items.category_override ELSE excluded.category END,kind=excluded.kind,size=excluded.size,mtime=excluded.mtime,available=1,scanned_at=excluded.scanned_at,hidden=excluded.hidden,extension=excluded.extension,ignored=excluded.ignored,game_status=CASE WHEN items.game_status_override!='' THEN items.game_status_override WHEN items.launch_path!='' THEN 'Instalados' ELSE excluded.game_status END''',pending)
+      db.executemany('''INSERT INTO items(id,source_id,path,name,category,kind,size,mtime,available,scanned_at,hidden,game_status,extension,ignored,series_title,season,episode,collection_name,media_year)
+       VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET source_id=excluded.source_id,name=excluded.name,category=CASE WHEN items.category_override!='' THEN items.category_override ELSE excluded.category END,kind=excluded.kind,size=excluded.size,mtime=excluded.mtime,available=1,scanned_at=excluded.scanned_at,hidden=excluded.hidden,extension=excluded.extension,ignored=excluded.ignored,series_title=excluded.series_title,season=excluded.season,episode=excluded.episode,collection_name=CASE WHEN items.metadata_json!='' THEN items.collection_name ELSE excluded.collection_name END,media_year=COALESCE(items.media_year,excluded.media_year),game_status=CASE WHEN items.game_status_override!='' THEN items.game_status_override WHEN items.launch_path!='' THEN 'Instalados' ELSE excluded.game_status END''',pending)
       pending.clear()
    def add(p, cat, kind, status=''):
+    nonlocal scan_source_error
     try:st=p.stat()
-    except OSError:return
+    except OSError:
+     scan_source_error=True
+     return
     hidden=hidden_for_item(str(p),source['path'])
     ignored=int(is_internal_game_media(p,kind,hide_game_assets,source['category'],source['path']) or ignored_hidden_elsewhere(str(p),source['path']))
-    pending.append((str(uuid.uuid5(uuid.NAMESPACE_URL,str(p).lower())),sid,str(p),p.stem if kind=='file' else p.name,cat,kind,st.st_size if kind=='file' else 0,st.st_mtime,now,hidden,status,extension_of(p,kind),ignored))
+    md=parse_local(str(p),cat) if kind=='file' and cat in ('Filmes','Séries') else {}
+    pending.append((str(uuid.uuid5(uuid.NAMESPACE_URL,str(p).lower())),sid,str(p),p.stem if kind=='file' else p.name,cat,kind,st.st_size if kind=='file' else 0,st.st_mtime,now,hidden,status,extension_of(p,kind),ignored,
+                    md.get('series_title',''),md.get('season'),md.get('episode'),md.get('collection',''),md.get('year')))
     with LOCK:STATE['found']+=1
     if len(pending)>=200:push()
    def index_game_root(game_root):
@@ -612,7 +731,9 @@ def scan_worker():
     index_game_root(root)
    else:
     def onerror(err):
-     with LOCK:STATE['error']=f'Algumas pastas não puderam ser acessadas: {err.__class__.__name__}'
+     nonlocal scan_source_error
+     scan_source_error=True
+     with LOCK:STATE['error']=f'Pastas inacessíveis em {root.name or str(root)}; catálogo anterior preservado ({err.__class__.__name__}).'
     for dirname,dirs,files in os.walk(root,followlinks=False,onerror=onerror):
      base=Path(dirname)
      with LOCK:STATE['current']=str(base) if not is_hidden_path(str(base),source['path']) else 'Área protegida'
@@ -630,8 +751,18 @@ def scan_worker():
      with LOCK:STATE['processed']+=1
      if not source['recursive']:break
    push()
-   # Remove cartões antigos fictícios (ex.: LUTA) e arquivos removidos, após scan completo.
-   with conn() as db:db.execute('DELETE FROM items WHERE source_id=? AND available=0',(sid,))
+   if scan_source_error:
+    # Não presumir que arquivos desapareceram se houve erro de acesso ao disco.
+    with LOCK:
+     STATE['sources_failed']+=1
+     if not STATE['error']:STATE['error']='Algumas pastas não foram lidas; itens antigos foram preservados.'
+   else:
+    # Remove somente entradas realmente ausentes após concluir essa fonte.
+    # As linhas detectadas recebem um token exclusivo via scanned_at.
+    with conn() as db:
+     cur=db.execute('DELETE FROM items WHERE source_id=? AND scanned_at!=?',(sid,now))
+     removed=max(cur.rowcount,0)
+    with LOCK:STATE['sources_ok']+=1;STATE['entries_removed']+=removed
  except Exception as exc:
   with LOCK:STATE['error']=str(exc)
  finally:
@@ -1078,6 +1209,23 @@ class Handler(BaseHTTPRequestHandler):
    if not unlocked(self):return json_reply(self,{'error':'Acesso exclusivo do administrador'},403)
    with conn() as db:rows=[dict(r) for r in db.execute('SELECT * FROM quarantine ORDER BY created_at DESC LIMIT 1000') if not blocked_remote(self,r['original_path']) and (not in_private_folder(r['original_path']) or protected_unlocked(self))]
    return json_reply(self,{'items':rows})
+  if u.path=='/api/media/collections':
+   cat=q.get('category',[''])[0]
+   if cat not in ('Filmes','Séries'):return json_reply(self,{'error':'Categoria inválida.'},400)
+   col='series_title' if cat=='Séries' else 'collection_name'
+   cond=f"category=? AND kind='file' AND hidden=0 AND ignored=0 AND {col}!=''"
+   args=[cat]
+   if not local_request(self):cond+=" AND UPPER(SUBSTR(path,1,2))!='C:'"
+   with conn() as db:
+    names=[dict(r) for r in db.execute(f'''SELECT {col} AS name,COUNT(*) AS count,MIN(id) AS cover_id
+      FROM items WHERE {cond} GROUP BY {col} ORDER BY {col} COLLATE NOCASE LIMIT 1000''',args)]
+   # Item cover_id pode estar associado a caminho privado somente se o registro falhou
+   # em marcar hidden; reforçar o teste de privacidade no próprio endpoint de imagem.
+   return json_reply(self,{'collections':names,'category':cat})
+  if u.path=='/api/metadata/status':
+   if not unlocked(self):return json_reply(self,{'error':'Admin necessário.'},403)
+   with METADATA_TASK_LOCK:state=METADATA_TASK.copy()
+   return json_reply(self,{'task':state,'tmdb_configured':bool(tmdb_key())})
   if u.path=='/api/media/folders':
    if q.get('category',[''])[0] not in ('Filmes','Séries'):
     return json_reply(self,{'error':'Categoria inválida.'},400)
@@ -1156,7 +1304,8 @@ class Handler(BaseHTTPRequestHandler):
    if not unlocked(self):sources=[x for x in sources if not is_hidden_path(x['path'],x['path'])]
    if not local_request(self):sources=[x for x in sources if not windows_system_drive(x['path'])]
    for s in sources:s['online']=Path(s['path']).is_dir()
-   return json_reply(self,{'status':state,'stats':stats,'total':total,'sources':sources,'service_mode':SERVICE_MODE,'can_locate':local_request(self),'media_filters':read_media_filters(),'ignored_media_count':ignored_count})
+   return json_reply(self,{'status':state,'stats':stats,'total':total,'sources':sources,'service_mode':SERVICE_MODE,'can_locate':local_request(self),'media_filters':read_media_filters(),'ignored_media_count':ignored_count,
+             'backup':BACKUPS.status() if unlocked(self) else None})
   if u.path=='/api/filters':
    scope=q.get('category',['Todos'])[0]
    subcat=q.get('subcategory',[''])[0]
@@ -1203,17 +1352,22 @@ class Handler(BaseHTTPRequestHandler):
    else:direct_paths=False
    if not local_request(self):where.append("UPPER(SUBSTR(path,1,2))!='C:'")
    if source:where.append('source_id=?');args.append(source)
+   collection=q.get('collection',[''])[0][:180]
+   if collection and cat in ('Filmes','Séries'):
+    col='series_title' if cat=='Séries' else 'collection_name'
+    where.append(col+'=?');args.append(collection)
    if search:where.append('(name LIKE ? OR path LIKE ?)');args.extend([f'%{search}%',f'%{search}%'])
    clause=(' WHERE '+' AND '.join(where)) if where else ''
    with conn() as db:
     if direct_paths:
      # Consulta caminhos catalogados, sem caminhar no disco. Usado só nas coleções.
-     candidates=[dict(r) for r in db.execute('SELECT * FROM items'+clause+' ORDER BY available DESC,name COLLATE NOCASE',args)]
+     candidates=[decorate_item(r) for r in db.execute('SELECT * FROM items'+clause+' ORDER BY available DESC,name COLLATE NOCASE',args)]
      candidates=[it for it in candidates if os.path.normcase(os.path.normpath(str(Path(it['path']).parent)))==os.path.normcase(os.path.normpath(folder))]
      total=len(candidates);items=candidates[(page-1)*60:page*60]
     else:
      total=db.execute('SELECT count(*) FROM items'+clause,args).fetchone()[0]
-     items=[dict(r) for r in db.execute('SELECT * FROM items'+clause+' ORDER BY available DESC,name COLLATE NOCASE LIMIT 60 OFFSET ?',args+[(page-1)*60])]
+     order='season ASC, episode ASC, name COLLATE NOCASE' if cat=='Séries' and collection else 'available DESC,name COLLATE NOCASE'
+     items=[decorate_item(r) for r in db.execute('SELECT * FROM items'+clause+' ORDER BY '+order+' LIMIT 60 OFFSET ?',args+[(page-1)*60])]
    return json_reply(self,{'total':total,'page':page,'items':items})
   if u.path.startswith('/api/download/'):
    it=guarded_item(self,u.path.rsplit('/',1)[-1]);return file_stream(self,Path(it['path']),bool(it['hidden']),download=True) if it and it['kind']=='file' else json_reply(self,{'error':'Não encontrado'},404)
@@ -1225,8 +1379,12 @@ class Handler(BaseHTTPRequestHandler):
   try:
    # Requisicoes POST so sao aceitas pela origem exata. Cookie SameSite=Strict.
    origin=self.headers.get('Origin','')
-   if origin and origin != f'http://{self.headers.get("Host", "")}' :
+   if self.headers.get('Sec-Fetch-Site','').casefold()=='cross-site':
     return json_reply(self,{'error':'Origem nao autorizada'},403)
+   if origin:
+    parsed=urlparse(origin)
+    if parsed.scheme not in ('http','https') or parsed.netloc.casefold()!=self.headers.get('Host','').casefold():
+     return json_reply(self,{'error':'Origem nao autorizada'},403)
    if u.path=='/api/upload':
     if self.headers.get('Content-Type','').lower()!='application/octet-stream':return json_reply(self,{'error':'Tipo de envio inválido.'},415)
     return receive_upload(self,parse_qs(u.query).get('destination',[''])[0])
@@ -1243,6 +1401,32 @@ class Handler(BaseHTTPRequestHandler):
    if u.path=='/api/duplicates/scan':return json_reply(self,{'started':DUPLICATES.start(),'status':DUPLICATES.snapshot()})
    if u.path=='/api/duplicates/cancel' and not local_request(self):return json_reply(self,{'error':'Exclusivo do PC servidor.'},403)
    if u.path=='/api/duplicates/cancel':return json_reply(self,{'cancel_requested':DUPLICATES.cancel()})
+   if u.path=='/api/metadata/search':
+    item=guarded_item(self,str(body.get('id','')))
+    if not item:return json_reply(self,{'error':'Item não encontrado.'},404)
+    if item['hidden'] or in_private_folder(item['path']):return json_reply(self,{'error':'Metadados externos indisponíveis para arquivos privados.'},403)
+    if item['category'] not in ('Jogos','Filmes','Séries','Músicas'):
+     return json_reply(self,{'error':'Esta categoria não oferece busca automática de metadados.'},400)
+    local=parse_local(item['path'],item['category'])
+    query=str(body.get('query') or (local['series_title'] if item['category']=='Séries' else local['title']) or item['name'])[:180]
+    try:return json_reply(self,lookup_metadata(query,item['category'],str(body.get('provider','auto')),tmdb_key()))
+    except ValueError as exc:return json_reply(self,{'error':str(exc)},400)
+   if u.path=='/api/metadata/apply':
+    item=guarded_item(self,str(body.get('id','')))
+    if not item:return json_reply(self,{'error':'Item não encontrado.'},404)
+    if item['hidden'] or in_private_folder(item['path']):return json_reply(self,{'error':'Área protegida.'},403)
+    with conn() as db:apply_metadata(db,item,body.get('choice'),bool(body.get('replace_cover',False)))
+    return json_reply(self,{'ok':True})
+   if u.path=='/api/metadata/auto':
+    limit=body.get('limit',25)
+    if not isinstance(limit,int) or not 1<=limit<=50:return json_reply(self,{'error':'Limite: 1 a 50.'},400)
+    category_filter=str(body.get('category',''))
+    if category_filter not in ('','Jogos','Filmes','Séries','Músicas'):return json_reply(self,{'error':'Categoria inválida.'},400)
+    with METADATA_TASK_LOCK:
+     if METADATA_TASK['running']:return json_reply(self,{'error':'Busca de metadados já em andamento.'},409)
+     METADATA_TASK.update(running=True,processed=0,updated=0,skipped=0,error='',current='',finished_at=None)
+    threading.Thread(target=metadata_batch_worker,args=(limit,category_filter,not local_request(self)),daemon=True).start()
+    return json_reply(self,{'started':True})
    if u.path=='/api/file-operation':return operate_on_item(self,body)
    if u.path=='/api/bulk-trash':return bulk_recycle_items(self,body)
    if u.path=='/api/cover-search':return search_game_art(self,body)
@@ -1266,6 +1450,12 @@ class Handler(BaseHTTPRequestHandler):
     with SESS_LOCK:SESSIONS.pop(current_token(self),None)
     pcookie=protected_lock(self)
     self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Set-Cookie','sl_admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');self.send_header('Set-Cookie',pcookie);self.end_headers();self.wfile.write(b'{"ok":true}');return
+   if u.path=='/api/backup':
+    try:
+     path=BACKUPS.create(force=True)
+     return json_reply(self,{'ok':True,'created':path.name,'backup':BACKUPS.status()})
+    except (OSError,sqlite3.DatabaseError,RuntimeError) as exc:
+     return json_reply(self,{'error':'Falha ao criar backup: '+str(exc)},500)
    if u.path=='/api/media-filters':
     enabled=body.get('ocultar_midias_steam')
     if type(enabled) is not bool:return json_reply(self,{'error':'Valor de filtro inválido'},400)
@@ -1324,7 +1514,8 @@ class Handler(BaseHTTPRequestHandler):
      if not row:return json_reply(self,{'error':'Local não encontrado'},404)
      detected=category(item['path'],row['category']) if item['kind']=='file' else item['category']
      cat=category_override or detected
-     db.execute("UPDATE items SET cover=?,launch_path=?,name=COALESCE(NULLIF(?,''),name),game_status_override=?,game_status=CASE WHEN ?!='' THEN ? WHEN ?!='' THEN 'Instalados' ELSE game_status END,category=?,category_override=? WHERE id=?",(cover,launch,name,override,override,override,launch,cat,category_override,iid))
+     local=parse_local(item['path'],cat) if cat in ('Filmes','Séries') else {}
+     db.execute("UPDATE items SET cover=?,launch_path=?,name=COALESCE(NULLIF(?,''),name),game_status_override=?,game_status=CASE WHEN ?!='' THEN ? WHEN ?!='' THEN 'Instalados' ELSE game_status END,category=?,category_override=?,series_title=?,season=?,episode=?,collection_name=CASE WHEN metadata_json!='' THEN collection_name ELSE ? END,media_year=COALESCE(media_year,?) WHERE id=?",(cover,launch,name,override,override,override,launch,cat,category_override,local.get('series_title',''),local.get('season'),local.get('episode'),local.get('collection',''),local.get('year'),iid))
     return json_reply(self,{'ok':True})
    return json_reply(self,{'error':'Rota desconhecida'},404)
   except Exception as e:return json_reply(self,{'error':str(e)},400)
@@ -1336,6 +1527,17 @@ def main(stop_event=None, service_mode=False):
   HOST=os.environ.get('SMART_LIBRARY_HOST','0.0.0.0')
  init()
  protect_thumbnail_cache()
+ # Um backup diário consistente (SQLite Online Backup), inclusive em modo Serviço.
+ # Se a pasta de backup não estiver acessível, o catálogo continua funcionando.
+ try:BACKUPS.create(force=False)
+ except (OSError,sqlite3.DatabaseError,RuntimeError) as exc:print('[AVISO] Backup automático:',exc,flush=True)
+ def auto_backup_loop():
+  while True:
+   if stop_event is not None and stop_event.wait(6*3600):break
+   if stop_event is None:time.sleep(6*3600)
+   try:BACKUPS.create(force=False)
+   except (OSError,sqlite3.DatabaseError,RuntimeError) as exc:print('[AVISO] Backup automático:',exc,flush=True)
+ threading.Thread(target=auto_backup_loop,daemon=True,name='SmartLibraryBackup').start()
  # Cada versão tem sua porta; se estiver ocupada, escolhe outra na sequência.
  ports = [PORT] if (os.getenv('SMART_LIBRARY_PORT') or service_mode) else range(PORT, PORT + 6)
  httpd = None
@@ -1351,7 +1553,7 @@ def main(stop_event=None, service_mode=False):
   raise OSError('Todas as portas disponíveis para o Smart Library estão ocupadas.')
  url = f'http://127.0.0.1:{httpd.server_port}' if HOST in ('0.0.0.0','::') else f'http://{HOST}:{httpd.server_port}'
  print('\n' + '=' * 55, flush=True)
- print(' SMART LIBRARY v1.0.15 -  SERVIDOR INICIADO', flush=True)
+ print(' SMART LIBRARY v1.0.17 -  SERVIDOR INICIADO', flush=True)
  print(' Acesse: ' + url, flush=True)
  print(' Para acesso pela rede, use http://IP-DO-PC:'+str(httpd.server_port), flush=True)
  print(' Mantenha esta janela aberta durante o uso.' if not service_mode else ' Executando como servico Windows.', flush=True)

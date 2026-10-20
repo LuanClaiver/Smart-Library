@@ -5,7 +5,7 @@ title Smart Library - Central de Controle
 :menu
 cls
 echo ===============================================
-echo            SMART LIBRARY v1.0.15
+echo            SMART LIBRARY v1.0.17
 echo ===============================================
 echo.
 echo  1 - Abrir biblioteca (navegador / modo local)
